@@ -54,6 +54,7 @@
 )
 
 ;; Read-only functions
+
 (define-read-only (get-wager (wager-id uint))
   (map-get? wagers { wager-id: wager-id })
 )
@@ -94,7 +95,23 @@
   )
 )
 
-
+(define-private (get-bet-amount-for-outcome (outcome-id uint) (wager-id uint))
+  (let
+    (
+      (bettor-position (get-bettor-position wager-id tx-sender))
+    )
+    (if (is-some bettor-position)
+      (let
+        ((position-details (unwrap! bettor-position u0)))
+        (if (is-eq (get chosen-outcome position-details) outcome-id)
+          (get bet-amount position-details)
+          u0
+        )
+      )
+      u0
+    )
+  )
+)
 
 (define-private (get-total-bet-on-outcome (outcome-id uint))
   (get-bet-amount-for-outcome outcome-id (var-get next-wager-id))
@@ -148,6 +165,62 @@
 )
 
 ;; Public functions
+
+(define-public (create-wager (description (string-ascii 256)) (outcomes (list 10 (string-ascii 64))) (end-block uint) (wager-type (string-ascii 20)) (odds (optional (list 10 uint))))
+  (let
+    (
+      (new-wager-id (var-get next-wager-id))
+    )
+    (asserts! (> (len description) u0) ERR-INVALID-WAGER-DESCRIPTION)
+    (asserts! (> (len outcomes) u1) ERR-INVALID-OUTCOME-COUNT)
+    (asserts! (> end-block block-height) ERR-INVALID-END-BLOCK)
+    (asserts! (is-some (index-of (var-get supported-wager-types) wager-type)) ERR-INVALID-WAGER-TYPE)
+    (asserts! (or (is-eq wager-type "winner-take-all") (is-eq wager-type "proportional") (is-some odds)) ERR-MISSING-ODDS-DATA)
+    (map-set wagers
+      { wager-id: new-wager-id }
+      {
+        creator: tx-sender,
+        description: description,
+        outcomes: outcomes,
+        total-pool: u0,
+        active: true,
+        winning-outcomes: (list),
+        end-block: end-block,
+        wager-type: wager-type,
+        odds: odds
+      }
+    )
+    (var-set next-wager-id (+ new-wager-id u1))
+    (ok new-wager-id)
+  )
+)
+
+(define-public (place-bet (wager-id uint) (chosen-outcome uint) (bet-amount uint))
+  (let
+    (
+      (wager (unwrap! (get-wager wager-id) ERR-WAGER-DOES-NOT-EXIST))
+      (existing-position (default-to { chosen-outcome: u0, bet-amount: u0 } (get-bettor-position wager-id tx-sender)))
+    )
+    (asserts! (> bet-amount u0) ERR-INVALID-BET-AMOUNT)
+    (asserts! (get active wager) ERR-WAGER-CLOSED)
+    (asserts! (>= (len (get outcomes wager)) chosen-outcome) ERR-INVALID-OUTCOME-SELECTION)
+    (asserts! (< block-height (get end-block wager)) ERR-WAGER-EXPIRED)
+    (try! (stx-transfer? bet-amount tx-sender (as-contract tx-sender)))
+    (map-set bettor-positions
+      { wager-id: wager-id, bettor: tx-sender }
+      {
+        chosen-outcome: chosen-outcome,
+        bet-amount: (+ bet-amount (get bet-amount existing-position))
+      }
+    )
+    (map-set wagers
+      { wager-id: wager-id }
+      (merge wager { total-pool: (+ (get total-pool wager) bet-amount) })
+    )
+    (ok true)
+  )
+)
+
 (define-public (close-wager (wager-id uint))
   (let
     (
@@ -181,6 +254,25 @@
     
     ;; Then process refunds
     (process-refunds wager-id)
+  )
+)
+
+(define-public (claim-winnings (wager-id uint))
+  (let
+    (
+      (wager (unwrap! (get-wager wager-id) ERR-WAGER-DOES-NOT-EXIST))
+      (bettor-position (unwrap! (get-bettor-position wager-id tx-sender) ERR-WAGER-DOES-NOT-EXIST))
+      (winning-outcomes (get winning-outcomes wager))
+    )
+    (asserts! (is-some (index-of winning-outcomes (get chosen-outcome bettor-position))) ERR-NOT-WINNING-SELECTION)
+    (let
+      (
+        (payout-amount (calculate-payout wager bettor-position winning-outcomes))
+      )
+      (try! (as-contract (stx-transfer? payout-amount tx-sender tx-sender)))
+      (map-delete bettor-positions { wager-id: wager-id, bettor: tx-sender })
+      (ok payout-amount)
+    )
   )
 )
 
